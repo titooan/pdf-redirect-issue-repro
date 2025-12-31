@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import json
+import struct
+import zlib
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
@@ -57,6 +60,114 @@ def generate_sample_pdf():
     return buffer.getvalue(), "redirect-sample.pdf"
 
 
+def generate_solid_color_png(size: int, rgb: tuple[int, int, int]) -> bytes:
+    """Return a PNG with the requested size and solid color."""
+    width = height = size
+    png_signature = b"\x89PNG\r\n\x1a\n"
+
+    def chunk(name: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(name + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + name + data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = bytes(rgb) * width
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    idat = zlib.compress(raw)
+    return png_signature + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+PWA_ICON_192 = generate_solid_color_png(192, (79, 70, 229))
+PWA_ICON_512 = generate_solid_color_png(512, (55, 65, 81))
+
+PWA_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0f172a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>PDF Redirect PWA</title>
+    <link rel="manifest" href="/pwa/manifest.json">
+    <link rel="icon" sizes="192x192" href="/pwa/icon-192.png">
+    <link rel="apple-touch-icon" href="/pwa/icon-192.png">
+    <style>
+      body {{
+        margin: 0;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        min-height: 100vh;
+        background: linear-gradient(180deg, #0f172a 0%, #1e293b 100%);
+        color: #f8fafc;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        text-align: center;
+      }}
+      button {{
+        font-size: 1.5rem;
+        padding: 1.25rem 2rem;
+        border-radius: 999px;
+        border: none;
+        background: #38bdf8;
+        color: #0f172a;
+        font-weight: 600;
+        box-shadow: 0 10px 25px rgba(15, 23, 42, 0.6);
+      }}
+      button:active {{
+        transform: scale(0.98);
+      }}
+    </style>
+    <script>
+      if ('serviceWorker' in navigator) {{
+        window.addEventListener('load', () => {{
+          navigator.serviceWorker.register('/sw.js').catch(console.error);
+        }});
+      }}
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>PDF Redirect Debug PWA</h1>
+      <p>Install this PWA, then tap the button to launch the redirect chain.</p>
+      <button id="load-pdf">Load PDF</button>
+    </main>
+    <script>
+      document.getElementById('load-pdf').addEventListener('click', () => {{
+        window.location.href = '/start';
+      }});
+    </script>
+  </body>
+</html>
+"""
+
+PWA_MANIFEST = {
+    "id": "/pwa/",
+    "name": "PDF Redirect Debug",
+    "short_name": "PDF Redirect",
+    "start_url": "/pwa/",
+    "scope": "/",
+    "display": "standalone",
+    "background_color": "#0f172a",
+    "theme_color": "#0f172a",
+    "display_override": ["standalone"],
+    "icons": [
+        {"src": "/pwa/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+        {"src": "/pwa/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+    ],
+}
+
+SW_JS = """self.addEventListener('install', event => {
+  self.skipWaiting();
+});
+self.addEventListener('activate', event => {
+  event.waitUntil(self.clients.claim());
+});
+self.addEventListener('fetch', event => {
+  event.respondWith(fetch(event.request));
+});
+"""
+
+
 def build_handler(pdf_bytes: bytes, filename: str):
     class RedirectingPdfHandler(BaseHTTPRequestHandler):
         server_version = "PdfRedirectServer/1.0"
@@ -71,7 +182,38 @@ def build_handler(pdf_bytes: bytes, filename: str):
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
 
+        def _send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK, extra_headers=None):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            if extra_headers:
+                for key, value in extra_headers.items():
+                    self.send_header(key, value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
+            if self.path in {"/pwa", "/pwa/"}:
+                self._send_bytes(PWA_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+
+            if self.path == "/pwa/manifest.json":
+                body = json.dumps(PWA_MANIFEST).encode("utf-8")
+                self._send_bytes(body, "application/manifest+json; charset=utf-8")
+                return
+
+            if self.path == "/pwa/icon-192.png":
+                self._send_bytes(PWA_ICON_192, "image/png")
+                return
+
+            if self.path == "/pwa/icon-512.png":
+                self._send_bytes(PWA_ICON_512, "image/png")
+                return
+
+            if self.path == "/sw.js":
+                self._send_bytes(SW_JS.encode("utf-8"), "application/javascript; charset=utf-8")
+                return
             if self.path.startswith("/start"):
                 self._send_redirect("/redirect-1")
                 return
