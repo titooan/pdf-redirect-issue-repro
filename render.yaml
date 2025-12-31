@@ -4,5 +4,5 @@ services:
     env: python
     plan: free
     autoDeploy: true
-    buildCommand: ""
-    startCommand: python tools/pdf-debug/pdf_redirect_server.py --port $PORT
+    buildCommand: 'pip install -r tools/pdf-debug/requirements.txt'
+    startCommand: 'python tools/pdf-debug/pdf_redirect_server.py --port $PORT'
