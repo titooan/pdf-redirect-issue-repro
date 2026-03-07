@@ -8,6 +8,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote
 
 
 def generate_sample_pdf():
@@ -129,11 +130,31 @@ PWA_HTML = """<!doctype html>
     <main>
       <h1>PDF Redirect Debug PWA</h1>
       <p>Install this PWA, then tap the button to launch the redirect chain.</p>
-      <button id="load-pdf">Load PDF</button>
+      <p>
+        <button id="load-pdf">Load PDF</button>
+      </p>
+      <p>
+        <button id="load-page">Load Page</button>
+      </p>
+      <p>
+        <button id="open-popup">Open popup</button>
+      </p>
+      <p>
+        <button id="open-ticket">Ticket</button>
+      </p>
     </main>
     <script>
       document.getElementById('load-pdf').addEventListener('click', () => {{
         window.location.href = '/start';
+      }});
+      document.getElementById('load-page').addEventListener('click', () => {{
+        window.location.href = '/start-html';
+      }});
+      document.getElementById('open-popup').addEventListener('click', () => {{
+        window.open('/start-popup', 'redirect-popup', 'popup=yes,width=450,height=700');
+      }});
+      document.getElementById('open-ticket').addEventListener('click', () => {{
+        window.location.href = '/ticket';
       }});
     </script>
   </body>
@@ -167,6 +188,76 @@ self.addEventListener('fetch', event => {
 });
 """
 
+HTML_REDIRECT_TARGET = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Redirect Target Page</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #f8fafc;
+        color: #0f172a;
+      }
+      main {
+        text-align: center;
+        padding: 2rem;
+      }
+      a {
+        color: #0369a1;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>HTML Redirect Target</h1>
+      <p>You reached this page through the same multi-hop redirect pattern as the PDF flow.</p>
+      <p><a href="/pwa/">Back to PWA home</a></p>
+    </main>
+  </body>
+</html>
+"""
+
+POPUP_REDIRECT_TARGET = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Popup Redirect Target</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        background: #111827;
+        color: #f9fafb;
+      }
+      main {
+        text-align: center;
+        padding: 2rem;
+      }
+      a {
+        color: #38bdf8;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Popup Redirect Target</h1>
+      <p>This page was opened in a popup through a dedicated redirect chain.</p>
+      <p><a href="/pwa/">Back to PWA home</a></p>
+    </main>
+  </body>
+</html>
+"""
+
 
 def build_handler(pdf_bytes: bytes, filename: str):
     class RedirectingPdfHandler(BaseHTTPRequestHandler):
@@ -194,35 +285,95 @@ def build_handler(pdf_bytes: bytes, filename: str):
             self.wfile.write(body)
 
         def do_GET(self):  # noqa: N802 - BaseHTTPRequestHandler API
-            if self.path in {"/pwa", "/pwa/"}:
+            request_path = self.path.split("?", 1)[0].split("#", 1)[0]
+
+            if request_path in {"/pwa", "/pwa/"}:
                 self._send_bytes(PWA_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 return
 
-            if self.path == "/pwa/manifest.json":
+            if request_path == "/pwa/manifest.json":
                 body = json.dumps(PWA_MANIFEST).encode("utf-8")
                 self._send_bytes(body, "application/manifest+json; charset=utf-8")
                 return
 
-            if self.path == "/pwa/icon-192.png":
+            if request_path == "/pwa/icon-192.png":
                 self._send_bytes(PWA_ICON_192, "image/png")
                 return
 
-            if self.path == "/pwa/icon-512.png":
+            if request_path == "/pwa/icon-512.png":
                 self._send_bytes(PWA_ICON_512, "image/png")
                 return
 
-            if self.path == "/sw.js":
+            if request_path == "/sw.js":
                 self._send_bytes(SW_JS.encode("utf-8"), "application/javascript; charset=utf-8")
                 return
-            if self.path.startswith("/start"):
+
+            if request_path == "/start-html":
+                self._send_redirect("/redirect-html-1")
+                return
+
+            if request_path == "/redirect-html-1":
+                self._send_redirect("/redirect-html-2")
+                return
+
+            if request_path == "/redirect-html-2":
+                self._send_bytes(HTML_REDIRECT_TARGET.encode("utf-8"), "text/html; charset=utf-8")
+                return
+
+            if request_path == "/start-popup":
+                self._send_redirect("/redirect-popup-1")
+                return
+
+            if request_path == "/redirect-popup-1":
+                self._send_redirect("/redirect-popup-2")
+                return
+
+            if request_path == "/redirect-popup-2":
+                self._send_bytes(POPUP_REDIRECT_TARGET.encode("utf-8"), "text/html; charset=utf-8")
+                return
+
+            if request_path == "/ticket":
+                target = self._absolute_location("/voucher/pdf/local-debug-token==?SPMID=LOCAL_TEST")
+                encoded_target = quote(target, safe="")
+                self._send_redirect(
+                    f"/url?q={encoded_target}&source=gmail&ust=1772968368397000&usg=AOvVawLocalDebugToken"
+                )
+                return
+
+            if request_path == "/url":
+                query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+                target_url = query.get("q", [""])[0]
+                if target_url:
+                    self.send_response(HTTPStatus.FOUND)
+                    self.send_header("Location", unquote(target_url))
+                    self.send_header("Cache-Control", "private")
+                    self.send_header("Content-Type", "text/html; charset=UTF-8")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self._send_bytes(b"Missing query parameter: q\n", "text/plain; charset=utf-8", HTTPStatus.BAD_REQUEST)
+                return
+
+            if request_path.startswith("/voucher/pdf/"):
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="giftcard.pdf"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(pdf_bytes)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(pdf_bytes)
+                return
+
+            if request_path == "/start":
                 self._send_redirect("/redirect-1")
                 return
 
-            if self.path.startswith("/redirect-1"):
+            if request_path == "/redirect-1":
                 self._send_redirect("/redirect-2")
                 return
 
-            if self.path.startswith("/redirect-2"):
+            if request_path == "/redirect-2":
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/pdf")
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -235,6 +386,9 @@ def build_handler(pdf_bytes: bytes, filename: str):
             body = (
                 "Endpoints:\n"
                 "  /start -> /redirect-1 -> /redirect-2 -> PDF response\n"
+                "  /start-html -> /redirect-html-1 -> /redirect-html-2 -> HTML page\n"
+                "  /start-popup -> /redirect-popup-1 -> /redirect-popup-2 -> popup HTML page\n"
+                "  /ticket -> /url?q=<encoded target> -> /voucher/pdf/... -> attachment download\n"
                 "Use http://<host>:<port>/start inside the custom tab to reproduce the issue.\n"
             ).encode("utf-8")
             self.send_response(HTTPStatus.OK)
