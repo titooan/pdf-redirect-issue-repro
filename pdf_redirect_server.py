@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 def generate_sample_pdf():
@@ -75,6 +76,13 @@ def generate_solid_color_png(size: int, rgb: tuple[int, int, int]) -> bytes:
     raw = b"".join(b"\x00" + row for _ in range(height))
     idat = zlib.compress(raw)
     return png_signature + chunk(b"IHDR", ihdr) + chunk(b"IDAT", idat) + chunk(b"IEND", b"")
+
+
+def generate_sample_zip() -> bytes:
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr("ticket.txt", "Local debug zip-ticket payload.\n")
+    return buffer.getvalue()
 
 
 PWA_ICON_192 = generate_solid_color_png(192, (79, 70, 229))
@@ -259,7 +267,7 @@ POPUP_REDIRECT_TARGET = """<!doctype html>
 """
 
 
-def build_handler(pdf_bytes: bytes, filename: str):
+def build_handler(pdf_bytes: bytes, filename: str, zip_bytes: bytes):
     class RedirectingPdfHandler(BaseHTTPRequestHandler):
         server_version = "PdfRedirectServer/1.0"
 
@@ -340,6 +348,14 @@ def build_handler(pdf_bytes: bytes, filename: str):
                 )
                 return
 
+            if request_path == "/zip-ticket":
+                target = self._absolute_location("/voucher/zip/local-debug-token==?SPMID=LOCAL_TEST")
+                encoded_target = quote(target, safe="")
+                self._send_redirect(
+                    f"/url?q={encoded_target}&source=gmail&ust=1772968368397000&usg=AOvVawLocalDebugToken"
+                )
+                return
+
             if request_path == "/url":
                 query = parse_qs(self.path.partition("?")[2], keep_blank_values=True)
                 target_url = query.get("q", [""])[0]
@@ -363,6 +379,17 @@ def build_handler(pdf_bytes: bytes, filename: str):
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
                 self.wfile.write(pdf_bytes)
+                return
+
+            if request_path.startswith("/voucher/zip/"):
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Disposition", 'attachment; filename="ticket.zip"')
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(zip_bytes)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(zip_bytes)
                 return
 
             if request_path == "/start":
@@ -389,6 +416,7 @@ def build_handler(pdf_bytes: bytes, filename: str):
                 "  /start-html -> /redirect-html-1 -> /redirect-html-2 -> HTML page\n"
                 "  /start-popup -> /redirect-popup-1 -> /redirect-popup-2 -> popup HTML page\n"
                 "  /ticket -> /url?q=<encoded target> -> /voucher/pdf/... -> attachment download\n"
+                "  /zip-ticket -> /url?q=<encoded target> -> /voucher/zip/... -> attachment download\n"
                 "Use http://<host>:<port>/start inside the custom tab to reproduce the issue.\n"
             ).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -413,7 +441,8 @@ def main():
     else:
         pdf_path = args.pdf.resolve(strict=True)
         pdf_bytes, filename = pdf_path.read_bytes(), pdf_path.name
-    handler = build_handler(pdf_bytes, filename)
+    zip_bytes = generate_sample_zip()
+    handler = build_handler(pdf_bytes, filename, zip_bytes)
     with ThreadingHTTPServer(("0.0.0.0", args.port), handler) as httpd:
         print(f"Serving redirects on http://localhost:{args.port}/start")
         httpd.serve_forever()
